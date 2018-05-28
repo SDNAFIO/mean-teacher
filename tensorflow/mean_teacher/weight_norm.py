@@ -99,8 +99,10 @@ def conv2d(inputs, num_outputs,
             x_init = tf.nn.conv2d(inputs, V_norm, [1] + stride + [1], padding)
             m_init, v_init = tf.nn.moments(x_init, [0, 1, 2])
             scale_init = init_scale / tf.sqrt(v_init + 1e-8)
+            #scale_init = tf.Print(scale_init, [scale_init], message=scope)
+
             g = tf.get_variable('g', dtype=tf.float32, shape=[num_outputs],
-                                initializer=tf.zeros_initializer(), trainable=True)
+                                trainable=True)
             b = tf.get_variable('b', dtype=tf.float32,
                                 initializer=tf.zeros_like(m_init), trainable=True)
 
@@ -114,6 +116,7 @@ def conv2d(inputs, num_outputs,
 
         else:
             V, g, b = [tf.get_variable(var_name) for var_name in ['V', 'g', 'b']]
+            #g = tf.Print(g, [g], message='loaded g, scope: {}'.format(scope))
 
             # use weight normalization (Salimans & Kingma, 2016)
             W = (tf.reshape(g, [1, 1, 1, num_outputs]) *

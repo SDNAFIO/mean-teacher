@@ -57,7 +57,7 @@ class Model:
 
         # Output schedule
         'print_span': 20,
-        'evaluation_span': 500,
+        'evaluation_span': 1000,
     }
 
     #pylint: disable=too-many-instance-attributes
@@ -102,10 +102,13 @@ class Model:
                                     step_rampup_value * self.hyper['ema_decay_after_rampup'],
                                     name='ema_decay')
 
+        # Note that the class_logits_2 and cons_logits_2 are only used in the pi model
+        # EMA net is the teacher net
+        # _1 is the student network
         (
-            (self.class_logits_1, self.cons_logits_1),
+            (self.class_logits_1, self.cons_logits_1), # student
             (self.class_logits_2, self.cons_logits_2),
-            (self.class_logits_ema, self.cons_logits_ema),
+            (self.class_logits_ema, self.cons_logits_ema), # teacher
             (self.class_logits_init, self.cons_logits_init)
         ) = inference(
             self.images,
@@ -120,18 +123,26 @@ class Model:
             num_logits=self.hyper['num_logits'])
 
         with tf.name_scope("objectives"):
+            # Error Rate between Classification and Labels for net1 and ema net
+            # This is a metric
             self.mean_error_1, self.errors_1 = errors(self.class_logits_1, self.labels)
             self.mean_error_ema, self.errors_ema = errors(self.class_logits_ema, self.labels)
 
+            # Cross entropy error between logits and labels for net1 and ema net
+            # mean only for logging
             self.mean_class_cost_1, self.class_costs_1 = classification_costs(
                 self.class_logits_1, self.labels)
+            # all only used for logging
             self.mean_class_cost_ema, self.class_costs_ema = classification_costs(
                 self.class_logits_ema, self.labels)
 
             labeled_consistency = self.hyper['apply_consistency_to_labeled']
             consistency_mask = tf.logical_or(tf.equal(self.labels, -1), labeled_consistency)
+            # Pi Model
             self.mean_cons_cost_pi, self.cons_costs_pi = consistency_costs(
                 self.cons_logits_1, self.class_logits_2, self.cons_coefficient, consistency_mask, self.hyper['consistency_trust'])
+            # Consistency cost
+            # Mean Teacher
             self.mean_cons_cost_mt, self.cons_costs_mt = consistency_costs(
                 self.cons_logits_1, self.class_logits_ema, self.cons_coefficient, consistency_mask, self.hyper['consistency_trust'])
 
@@ -141,20 +152,33 @@ class Model:
                 mean_l2 = tf.reduce_mean(l2s)
                 return mean_l2, l2s
 
+            # res costs (cost between the output logits)
+            # Student network
             self.mean_res_l2_1, self.res_l2s_1 = l2_norms(self.class_logits_1 - self.cons_logits_1)
-            self.mean_res_l2_ema, self.res_l2s_ema = l2_norms(self.class_logits_ema - self.cons_logits_ema)
             self.res_costs_1 = self.hyper['logit_distance_cost'] * self.res_l2s_1
             self.mean_res_cost_1 = tf.reduce_mean(self.res_costs_1)
+
+            # res costs (cost between the output logits)
+            # Teacher network
+            self.mean_res_l2_ema, self.res_l2s_ema = l2_norms(self.class_logits_ema - self.cons_logits_ema)
             self.res_costs_ema = self.hyper['logit_distance_cost'] * self.res_l2s_ema
             self.mean_res_cost_ema = tf.reduce_mean(self.res_costs_ema)
 
+            # Pi Model
             self.mean_total_cost_pi, self.total_costs_pi = total_costs(
                 self.class_costs_1, self.cons_costs_pi, self.res_costs_1)
+            # Mean Teacher
+            # Total cost is the sum of:
+            # cross entropy error of class logits_1 and labels
+            # consistency cost of logits_1 and logits_ema
+            # and the weighted "mean squared error cost between the output logits" (res_cost)
             self.mean_total_cost_mt, self.total_costs_mt = total_costs(
                 self.class_costs_1, self.cons_costs_mt, self.res_costs_1)
+
             assert_shape(self.total_costs_pi, [3])
             assert_shape(self.total_costs_mt, [3])
 
+            # Switch between Mean Teacher and Pi Model
             self.cost_to_be_minimized = tf.cond(self.hyper['ema_consistency'],
                                                 lambda: self.mean_total_cost_mt,
                                                 lambda: self.mean_total_cost_pi)
@@ -192,6 +216,11 @@ class Model:
             "train/total_cost/mt": self.mean_total_cost_mt,
         }
 
+        self.training_summaries = []
+        for (metric_name, metric_val) in self.training_metrics.items():
+            self.training_summaries.append(tf.summary.scalar(metric_name, metric_val))
+        self.training_summaries = tf.summary.merge(self.training_summaries)
+
         with tf.variable_scope("validation_metrics") as metrics_scope:
             self.metric_values, self.metric_update_ops = metrics.aggregate_metric_map({
                 "eval/error/1": streaming_mean(self.errors_1),
@@ -203,6 +232,12 @@ class Model:
             })
             metric_variables = slim.get_local_variables(scope=metrics_scope.name)
             self.metric_init_op = tf.variables_initializer(metric_variables)
+
+        self.validation_summaries = []
+        for (metric_name, metric_val) in self.metric_values.items():
+            self.validation_summaries.append(tf.summary.scalar(metric_name, metric_val))
+
+        self.validation_summaries = tf.summary.merge(self.validation_summaries)
 
         self.result_formatter = string_utils.DictFormatter(
             order=["eval/error/ema", "error/1", "class_cost/1", "cons_cost/mt"],
@@ -236,9 +271,10 @@ class Model:
         self.evaluate(evaluation_batches_fn)
         self.save_checkpoint()
         for batch in training_batches:
-            results, _ = self.run([self.training_metrics, self.train_step_op],
+            results, _, summaries = self.run([self.training_metrics, self.train_step_op, self.training_summaries],
                                   self.feed_dict(batch))
             step_control = self.get_training_control()
+            self.writer.add_summary(summaries, step_control['step'])
             self.training_log.record(step_control['step'], {**results, **step_control})
             if step_control['time_to_print']:
                 LOG.info("step %5d:   %s", step_control['step'], self.result_formatter.format_dict(results))
@@ -256,7 +292,8 @@ class Model:
             self.run(self.metric_update_ops,
                      feed_dict=self.feed_dict(batch, is_training=False))
         step = self.run(self.global_step)
-        results = self.run(self.metric_values)
+        results, summaries = self.run([self.metric_values, self.validation_summaries])
+        self.writer.add_summary(summaries, step)
         self.validation_log.record(step, results)
         LOG.info("step %5d:   %s", step, self.result_formatter.format_dict(results))
 
@@ -278,9 +315,9 @@ class Model:
         LOG.info("Saved checkpoint: %r", path)
 
     def save_tensorboard_graph(self):
-        writer = tf.summary.FileWriter(self.tensorboard_path)
-        writer.add_graph(self.session.graph)
-        return writer.get_logdir()
+        self.writer = tf.summary.FileWriter(self.tensorboard_path)
+        self.writer.add_graph(self.session.graph)
+        return self.writer.get_logdir()
 
 
 Hyperparam = namedtuple("Hyperparam", ['tensor', 'getter', 'setter'])
@@ -338,6 +375,7 @@ def inference(inputs, is_training, ema_decay, input_noise, student_dropout_proba
                       translate=translate,
                       num_logits=num_logits)
 
+    # Learn about difference between name and var scope!
     with tf.variable_scope("initialization") as var_scope:
         class_logits_init, cons_logits_init = tower(**tower_args, dropout_probability=student_dropout_probability, is_initialization=True)
     with name_variable_scope("primary", var_scope, reuse=True) as (name_scope, _):

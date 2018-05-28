@@ -65,6 +65,8 @@ def ema_variable_scope(name_scope_name, var_scope, decay=0.999):
     We capture only trainable variables. There's no reason we couldn't support
     other types of variables, but the assumed use case is for trainable variables.
     """
+    # Note, about @contextmanager
+    # everything before yield is called when the with statement is used
     with tf.name_scope(name_scope_name + "/ema_variables"):
         original_trainable_vars = {
             tensor.op.name: tensor
